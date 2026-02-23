@@ -170,6 +170,19 @@ def create_agent_settings_tab(webui_manager: WebuiManager):
     default_llm = os.getenv("DEFAULT_LLM", "openai")
     default_is_ollama = default_llm == "ollama"
 
+    # If default provider is ollama, fetch live models at startup
+    if default_is_ollama:
+        instances = config.get_ollama_instances()
+        default_ollama_host = list(instances.values())[0] if instances else "http://localhost:11434"
+        live_models = fetch_ollama_models_sync(default_ollama_host)
+        default_model_choices = live_models if live_models else config.model_names.get(default_llm, [])
+        default_model_value = default_model_choices[0] if default_model_choices else ""
+        default_base_url = default_ollama_host
+    else:
+        default_model_choices = config.model_names.get(default_llm, [])
+        default_model_value = default_model_choices[0] if default_model_choices else ""
+        default_base_url = ""
+
     with gr.Group():
         with gr.Row():
             llm_provider = gr.Dropdown(
@@ -181,8 +194,8 @@ def create_agent_settings_tab(webui_manager: WebuiManager):
             )
             llm_model_name = gr.Dropdown(
                 label="LLM Model Name",
-                choices=config.model_names[default_llm],
-                value=config.model_names[default_llm][0],
+                choices=default_model_choices,
+                value=default_model_value,
                 interactive=True,
                 allow_custom_value=True,
                 info="Select a model in the dropdown options or directly type a custom model name"
@@ -234,7 +247,7 @@ def create_agent_settings_tab(webui_manager: WebuiManager):
         with gr.Row():
             llm_base_url = gr.Textbox(
                 label="Base URL",
-                value="",
+                value=default_base_url,
                 info="API endpoint URL (if required)"
             )
             llm_api_key = gr.Textbox(
