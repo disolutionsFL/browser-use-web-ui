@@ -5,7 +5,7 @@ json-repair
 langchain-mistralai==0.2.4
 MainContentExtractor==0.0.4
 langchain-ibm==0.3.10
-langchain_mcp_adapters==0.0.9
+langchain_mcp_adapters
 langgraph==0.3.34
 langchain-community
 httpx
