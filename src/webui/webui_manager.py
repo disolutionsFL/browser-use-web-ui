@@ -94,6 +94,18 @@ class WebuiManager:
 
         return os.path.join(self.settings_save_dir, f"{config_name}.json")
 
+    def get_latest_config_path(self) -> Optional[str]:
+        """Find the most recent saved config file, if any."""
+        if not os.path.isdir(self.settings_save_dir):
+            return None
+        configs = sorted(
+            [f for f in os.listdir(self.settings_save_dir) if f.endswith(".json")],
+            reverse=True,
+        )
+        if configs:
+            return os.path.join(self.settings_save_dir, configs[0])
+        return None
+
     def load_config(self, config_path: str):
         """
         Load config

@@ -92,4 +92,15 @@ def create_ui(theme_name="Ocean"):
             with gr.TabItem("📁 Load & Save Config"):
                 create_load_save_config_tab(ui_manager)
 
+        # Auto-load the most recently saved config on page load
+        def auto_load_latest_config():
+            latest = ui_manager.get_latest_config_path()
+            if latest:
+                yield from ui_manager.load_config(latest)
+
+        demo.load(
+            fn=auto_load_latest_config,
+            outputs=ui_manager.get_components(),
+        )
+
     return demo
