@@ -6,6 +6,7 @@ from gradio.components import Component
 from typing import Any, Dict, Optional
 from src.webui.webui_manager import WebuiManager
 from src.utils import config
+from src.utils.llm_provider import fetch_ollama_models_sync
 import logging
 from functools import partial
 
@@ -22,6 +23,112 @@ def update_model_dropdown(llm_provider):
                            interactive=True)
     else:
         return gr.Dropdown(choices=[], value="", interactive=True, allow_custom_value=True)
+
+
+def _get_ollama_instance_choices():
+    """Build the choices list for Ollama instance dropdowns."""
+    instances = config.get_ollama_instances()
+    return list(instances.keys()) + ["Custom"]
+
+
+def _fetch_models_for_instance(instance_name):
+    """Fetch models from a named Ollama instance. Returns (host, models)."""
+    instances = config.get_ollama_instances()
+    host = instances.get(instance_name, "http://localhost:11434")
+    models = fetch_ollama_models_sync(host)
+    return host, models
+
+
+def on_provider_change(provider):
+    """When LLM provider changes, show/hide Ollama-specific components and fetch models."""
+    is_ollama = provider == "ollama"
+    if is_ollama:
+        instances = config.get_ollama_instances()
+        first_name = list(instances.keys())[0] if instances else "Local"
+        first_host = list(instances.values())[0] if instances else "http://localhost:11434"
+        models = fetch_ollama_models_sync(first_host)
+        if models:
+            return (
+                gr.update(visible=True),   # ollama_instance
+                gr.update(visible=False),  # ollama_custom_url
+                gr.update(visible=True),   # ollama_num_ctx
+                gr.Dropdown(choices=models, value=models[0], interactive=True, allow_custom_value=True),
+                gr.update(value=first_host),  # llm_base_url
+            )
+        # Instance unreachable — fall back to static list
+        return (
+            gr.update(visible=True),
+            gr.update(visible=False),
+            gr.update(visible=True),
+            update_model_dropdown(provider),
+            gr.update(value=first_host),
+        )
+    # Non-ollama provider
+    return (
+        gr.update(visible=False),
+        gr.update(visible=False),
+        gr.update(visible=False),
+        update_model_dropdown(provider),
+        gr.update(),  # leave base_url unchanged
+    )
+
+
+def on_instance_change(instance_name):
+    """When Ollama instance selection changes, fetch models from that instance."""
+    if instance_name == "Custom":
+        return gr.update(visible=True), gr.update(), gr.update()
+
+    host, models = _fetch_models_for_instance(instance_name)
+    if models:
+        return (
+            gr.update(visible=False),
+            gr.Dropdown(choices=models, value=models[0], interactive=True, allow_custom_value=True),
+            gr.update(value=host),
+        )
+    return (
+        gr.update(visible=False),
+        gr.Dropdown(choices=["(no models found)"], value="", interactive=True, allow_custom_value=True),
+        gr.update(value=host),
+    )
+
+
+def on_custom_url_submit(url):
+    """When a custom Ollama URL is entered, fetch models from it."""
+    models = fetch_ollama_models_sync(url)
+    if models:
+        return gr.Dropdown(choices=models, value=models[0], interactive=True, allow_custom_value=True), gr.update(value=url)
+    return gr.Dropdown(choices=["(unreachable)"], value="", interactive=True, allow_custom_value=True), gr.update(value=url)
+
+
+def on_planner_provider_change(provider):
+    """When Planner LLM provider changes, show/hide Ollama-specific components and fetch models."""
+    is_ollama = provider == "ollama"
+    if is_ollama:
+        instances = config.get_ollama_instances()
+        first_host = list(instances.values())[0] if instances else "http://localhost:11434"
+        models = fetch_ollama_models_sync(first_host)
+        if models:
+            return (
+                gr.update(visible=True),
+                gr.update(visible=False),
+                gr.update(visible=True),
+                gr.Dropdown(choices=models, value=models[0], interactive=True, allow_custom_value=True),
+                gr.update(value=first_host),
+            )
+        return (
+            gr.update(visible=True),
+            gr.update(visible=False),
+            gr.update(visible=True),
+            update_model_dropdown(provider),
+            gr.update(value=first_host),
+        )
+    return (
+        gr.update(visible=False),
+        gr.update(visible=False),
+        gr.update(visible=False),
+        update_model_dropdown(provider),
+        gr.update(),
+    )
 
 
 async def update_mcp_server(mcp_file: str, webui_manager: WebuiManager):
@@ -59,22 +166,41 @@ def create_agent_settings_tab(webui_manager: WebuiManager):
         mcp_json_file = gr.File(label="MCP server json", interactive=True, file_types=[".json"])
         mcp_server_config = gr.Textbox(label="MCP server", lines=6, interactive=True, visible=False)
 
+    ollama_instance_choices = _get_ollama_instance_choices()
+    default_llm = os.getenv("DEFAULT_LLM", "openai")
+    default_is_ollama = default_llm == "ollama"
+
     with gr.Group():
         with gr.Row():
             llm_provider = gr.Dropdown(
                 choices=[provider for provider, model in config.model_names.items()],
                 label="LLM Provider",
-                value=os.getenv("DEFAULT_LLM", "openai"),
+                value=default_llm,
                 info="Select LLM provider for LLM",
                 interactive=True
             )
             llm_model_name = gr.Dropdown(
                 label="LLM Model Name",
-                choices=config.model_names[os.getenv("DEFAULT_LLM", "openai")],
-                value=config.model_names[os.getenv("DEFAULT_LLM", "openai")][0],
+                choices=config.model_names[default_llm],
+                value=config.model_names[default_llm][0],
                 interactive=True,
                 allow_custom_value=True,
                 info="Select a model in the dropdown options or directly type a custom model name"
+            )
+        with gr.Row():
+            ollama_instance = gr.Dropdown(
+                choices=ollama_instance_choices,
+                label="Ollama Instance",
+                value=ollama_instance_choices[0] if ollama_instance_choices else "Custom",
+                visible=default_is_ollama,
+                interactive=True,
+                info="Select Ollama server or choose Custom to enter URL"
+            )
+            ollama_custom_url = gr.Textbox(
+                label="Custom Ollama URL",
+                placeholder="http://192.168.1.100:11434",
+                visible=False,
+                interactive=True
             )
         with gr.Row():
             llm_temperature = gr.Slider(
@@ -101,7 +227,7 @@ def create_agent_settings_tab(webui_manager: WebuiManager):
                 step=1,
                 label="Ollama Context Length",
                 info="Controls max context length model needs to handle (less = faster)",
-                visible=False,
+                visible=default_is_ollama,
                 interactive=True
             )
 
@@ -132,6 +258,21 @@ def create_agent_settings_tab(webui_manager: WebuiManager):
                 interactive=True,
                 allow_custom_value=True,
                 info="Select a model in the dropdown options or directly type a custom model name"
+            )
+        with gr.Row():
+            planner_ollama_instance = gr.Dropdown(
+                choices=ollama_instance_choices,
+                label="Planner Ollama Instance",
+                value=ollama_instance_choices[0] if ollama_instance_choices else "Custom",
+                visible=False,
+                interactive=True,
+                info="Select Ollama server or choose Custom to enter URL"
+            )
+            planner_ollama_custom_url = gr.Textbox(
+                label="Custom Ollama URL",
+                placeholder="http://192.168.1.100:11434",
+                visible=False,
+                interactive=True
             )
         with gr.Row():
             planner_llm_temperature = gr.Slider(
@@ -236,25 +377,42 @@ def create_agent_settings_tab(webui_manager: WebuiManager):
     ))
     webui_manager.add_components("agent_settings", tab_components)
 
+    # LLM provider change: show/hide Ollama components + fetch models
     llm_provider.change(
-        fn=lambda x: gr.update(visible=x == "ollama"),
-        inputs=llm_provider,
-        outputs=ollama_num_ctx
-    )
-    llm_provider.change(
-        lambda provider: update_model_dropdown(provider),
+        fn=on_provider_change,
         inputs=[llm_provider],
-        outputs=[llm_model_name]
+        outputs=[ollama_instance, ollama_custom_url, ollama_num_ctx, llm_model_name, llm_base_url]
     )
-    planner_llm_provider.change(
-        fn=lambda x: gr.update(visible=x == "ollama"),
-        inputs=[planner_llm_provider],
-        outputs=[planner_ollama_num_ctx]
+    # Ollama instance change: fetch models from selected instance
+    ollama_instance.change(
+        fn=on_instance_change,
+        inputs=[ollama_instance],
+        outputs=[ollama_custom_url, llm_model_name, llm_base_url]
     )
+    # Custom URL submit: fetch models from manually entered URL
+    ollama_custom_url.submit(
+        fn=on_custom_url_submit,
+        inputs=[ollama_custom_url],
+        outputs=[llm_model_name, llm_base_url]
+    )
+
+    # Planner LLM provider change
     planner_llm_provider.change(
-        lambda provider: update_model_dropdown(provider),
+        fn=on_planner_provider_change,
         inputs=[planner_llm_provider],
-        outputs=[planner_llm_model_name]
+        outputs=[planner_ollama_instance, planner_ollama_custom_url, planner_ollama_num_ctx, planner_llm_model_name, planner_llm_base_url]
+    )
+    # Planner Ollama instance change
+    planner_ollama_instance.change(
+        fn=on_instance_change,
+        inputs=[planner_ollama_instance],
+        outputs=[planner_ollama_custom_url, planner_llm_model_name, planner_llm_base_url]
+    )
+    # Planner custom URL submit
+    planner_ollama_custom_url.submit(
+        fn=on_custom_url_submit,
+        inputs=[planner_ollama_custom_url],
+        outputs=[planner_llm_model_name, planner_llm_base_url]
     )
 
     async def update_wrapper(mcp_file):

@@ -51,6 +51,20 @@ from pydantic import SecretStr
 
 from src.utils import config
 
+import httpx
+
+
+def fetch_ollama_models_sync(host: str, timeout: float = 5.0) -> list[str]:
+    """Query an Ollama instance for installed models via GET /api/tags."""
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.get(f"{host.rstrip('/')}/api/tags")
+            resp.raise_for_status()
+            data = resp.json()
+            return sorted([m["name"] for m in data.get("models", [])])
+    except Exception:
+        return []
+
 
 class DeepSeekR1ChatOpenAI(ChatOpenAI):
 

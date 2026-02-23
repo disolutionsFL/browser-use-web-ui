@@ -1,3 +1,20 @@
+import json
+import os
+
+
+def get_ollama_instances():
+    """Parse OLLAMA_INSTANCES env var (JSON array of {name, host} objects).
+    Falls back to localhost if not set or invalid."""
+    raw = os.getenv("OLLAMA_INSTANCES", "")
+    if raw:
+        try:
+            instances = json.loads(raw)
+            return {inst["name"]: inst["host"] for inst in instances}
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return {"Local": "http://localhost:11434"}
+
+
 PROVIDER_DISPLAY_NAMES = {
     "openai": "OpenAI",
     "azure_openai": "Azure OpenAI",
