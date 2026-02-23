@@ -1,11 +1,11 @@
-browser-use @ git+https://github.com/disolutionsFL/browser-use.git@main
+browser-use @ git+https://github.com/disolutionsFL/browser-use.git@1e6568cf
 pyperclip==1.9.0
 gradio==5.27.0
 json-repair
 langchain-mistralai==0.2.4
 MainContentExtractor==0.0.4
 langchain-ibm==0.3.10
-langchain_mcp_adapters
+langchain_mcp_adapters==0.0.9
 langgraph==0.3.34
 langchain-community
 httpx
