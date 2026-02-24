@@ -61,7 +61,14 @@ _current_status: dict = {
 }
 
 # --- MCP Server ---
-server = FastMCP("browser-use")
+# In mcp SDK 1.6.x, host/port are constructor settings; run() only takes transport.
+# Parse CLI args early so we can pass host/port to FastMCP constructor.
+_parser = argparse.ArgumentParser(description="browser-use MCP Server")
+_parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
+_parser.add_argument("--port", type=int, default=8934, help="Port to listen on")
+_args = _parser.parse_args()
+
+server = FastMCP("browser-use", host=_args.host, port=_args.port)
 
 
 @server.tool()
@@ -226,19 +233,12 @@ async def stop_task() -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="browser-use MCP Server")
-    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
-    parser.add_argument(
-        "--port", type=int, default=8934, help="Port to listen on"
-    )
-    args = parser.parse_args()
-
-    logger.info("Starting browser-use MCP server on %s:%d", args.host, args.port)
+    logger.info("Starting browser-use MCP server on %s:%d", _args.host, _args.port)
     logger.info("Default model: %s", DEFAULT_MODEL)
     logger.info("Default Ollama endpoint: %s", DEFAULT_OLLAMA_ENDPOINT)
     logger.info("Task timeout: %ds", TASK_TIMEOUT)
 
-    server.run(transport="streamable-http", host=args.host, port=args.port)
+    server.run(transport="sse")
 
 
 if __name__ == "__main__":
