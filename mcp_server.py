@@ -180,6 +180,9 @@ async def run_task(
                 }
             )
 
+            # num_ctx MUST match what Ollama already has loaded, or Ollama
+            # resizes the KV cache (unload + reload = expensive swap).
+            # DEFAULT_NUM_CTX should match the model's Modelfile num_ctx.
             llm = get_llm_model(
                 provider="ollama",
                 model_name=model or DEFAULT_MODEL,
