@@ -17,6 +17,7 @@ import logging
 import os
 import sys
 import argparse
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -49,7 +50,7 @@ DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.6"))
 DEFAULT_NUM_CTX = int(os.getenv("DEFAULT_NUM_CTX", "16000"))
 TASK_TIMEOUT = int(os.getenv("TASK_TIMEOUT", "300"))
 
-# --- Concurrency control ---
+# --- Concurrency control & state ---
 _task_lock = asyncio.Lock()
 _current_status: dict = {
     "running": False,
@@ -58,6 +59,15 @@ _current_status: dict = {
     "max_steps": 0,
     "started_at": None,
     "agent": None,
+    # Persisted after task completes so get_status can report last result
+    "last_status": None,       # "completed" | "failed" | "stopped" | "timeout" | "max_steps"
+    "last_task": None,
+    "last_result": None,
+    "last_error": None,
+    "last_finished_at": None,
+    "last_steps_taken": 0,
+    "last_actions": [],
+    "last_duration_s": 0,
 }
 
 # --- MCP Server ---
@@ -71,6 +81,55 @@ _args = _parser.parse_args()
 server = FastMCP("browser-use", host=_args.host, port=_args.port)
 
 
+def _format_result(
+    status: str,
+    task: str,
+    result: str | None = None,
+    error: str | None = None,
+    steps_taken: int = 0,
+    max_steps: int = 0,
+    actions: list[str] | None = None,
+    duration_s: float = 0,
+) -> str:
+    """Format a structured, unambiguous result string for LLM callers."""
+    lines = []
+    lines.append(f"STATUS: {status.upper()}")
+    lines.append(f"Task: {task}")
+    lines.append(f"Steps: {steps_taken}/{max_steps}")
+    if duration_s > 0:
+        lines.append(f"Duration: {duration_s:.1f}s")
+    if actions:
+        lines.append(f"Actions: {', '.join(actions)}")
+    if error:
+        lines.append(f"Error: {error}")
+    if result:
+        lines.append("")
+        lines.append(f"Result:\n{result}")
+    return "\n".join(lines)
+
+
+def _save_last_result(
+    status: str,
+    task: str,
+    result: str | None,
+    error: str | None,
+    steps_taken: int,
+    actions: list[str],
+    duration_s: float,
+):
+    """Cache the last task result so get_status can report it."""
+    _current_status.update({
+        "last_status": status,
+        "last_task": task,
+        "last_result": result,
+        "last_error": error,
+        "last_finished_at": datetime.now().isoformat(),
+        "last_steps_taken": steps_taken,
+        "last_actions": actions,
+        "last_duration_s": duration_s,
+    })
+
+
 @server.tool()
 async def run_task(
     task: str,
@@ -80,11 +139,12 @@ async def run_task(
     max_actions_per_step: int = 10,
     ollama_base_url: Optional[str] = None,
     num_ctx: Optional[int] = None,
+    enable_memory: bool = False,
 ) -> str:
     """Run a browser automation task using the browser-use agent.
 
     The agent autonomously navigates websites, fills forms, clicks buttons,
-    and extracts information. Returns the final result text.
+    and extracts information. Returns a structured result with clear STATUS.
 
     Args:
         task: Natural language description of the browser task to perform.
@@ -94,16 +154,21 @@ async def run_task(
         max_actions_per_step: Max browser actions per reasoning step.
         ollama_base_url: Override Ollama endpoint URL.
         num_ctx: Ollama context window size.
+        enable_memory: Enable agent long-term memory across steps.
     """
     if _task_lock.locked():
         return (
-            "ERROR: A task is already running. "
+            "STATUS: BUSY\n"
+            "A task is already running. "
             "Use get_status to check progress or stop_task to cancel."
         )
 
     async with _task_lock:
         browser = None
         context = None
+        start_time = time.monotonic()
+        steps_taken = 0
+        action_names = []
         try:
             _current_status.update(
                 {
@@ -153,15 +218,16 @@ async def run_task(
                 controller=controller,
                 use_vision=use_vision,
                 max_actions_per_step=max_actions_per_step,
-                enable_memory=False,
+                enable_memory=enable_memory,
             )
             _current_status["agent"] = agent
 
             logger.info(
-                "Running task: %s (model=%s, max_steps=%d)",
+                "Running task: %s (model=%s, max_steps=%d, memory=%s)",
                 task,
                 model or DEFAULT_MODEL,
                 max_steps,
+                enable_memory,
             )
 
             history = await asyncio.wait_for(
@@ -169,23 +235,85 @@ async def run_task(
                 timeout=TASK_TIMEOUT,
             )
 
-            final = history.final_result()
-            if final:
-                return f"Task completed.\n\nResult:\n{final}"
+            duration_s = time.monotonic() - start_time
+            steps_taken = len(history.history) if history.history else 0
+            try:
+                action_names = history.action_names()
+            except Exception:
+                action_names = []
 
-            errors = history.errors()
-            if errors:
-                return "Task finished with errors:\n" + "\n".join(
-                    str(e) for e in errors[-3:]
+            final = history.final_result()
+            is_done = history.is_done()
+            is_successful = history.is_successful()
+
+            if is_done and final:
+                status = "completed" if is_successful else "failed"
+                _save_last_result(status, task, final, None, steps_taken, action_names, duration_s)
+                return _format_result(
+                    status=status,
+                    task=task,
+                    result=final,
+                    steps_taken=steps_taken,
+                    max_steps=max_steps,
+                    actions=action_names,
+                    duration_s=duration_s,
                 )
 
-            return "Task completed but no explicit result was returned by the agent."
+            # Agent finished without calling done -- hit max steps
+            errors = history.errors()
+            error_text = None
+            if errors:
+                error_msgs = [str(e) for e in errors[-3:] if e]
+                if error_msgs:
+                    error_text = "; ".join(error_msgs)
+
+            # Try to extract any useful content from the last step
+            last_content = None
+            if history.history:
+                for step in reversed(history.history):
+                    for result in reversed(step.result):
+                        if result.extracted_content:
+                            last_content = result.extracted_content
+                            break
+                    if last_content:
+                        break
+
+            _save_last_result("max_steps", task, last_content, error_text, steps_taken, action_names, duration_s)
+            return _format_result(
+                status="max_steps_reached",
+                task=task,
+                result=last_content,
+                error=error_text or f"Agent did not call done within {max_steps} steps",
+                steps_taken=steps_taken,
+                max_steps=max_steps,
+                actions=action_names,
+                duration_s=duration_s,
+            )
 
         except asyncio.TimeoutError:
-            return f"ERROR: Task timed out after {TASK_TIMEOUT} seconds."
+            duration_s = time.monotonic() - start_time
+            _save_last_result("timeout", task, None, f"Timed out after {TASK_TIMEOUT}s", steps_taken, action_names, duration_s)
+            return _format_result(
+                status="timeout",
+                task=task,
+                error=f"Task timed out after {TASK_TIMEOUT} seconds",
+                steps_taken=steps_taken,
+                max_steps=max_steps,
+                duration_s=duration_s,
+            )
         except Exception as e:
+            duration_s = time.monotonic() - start_time
             logger.exception("Task failed")
-            return f"ERROR: {type(e).__name__}: {e}"
+            error_msg = f"{type(e).__name__}: {e}"
+            _save_last_result("failed", task, None, error_msg, steps_taken, action_names, duration_s)
+            return _format_result(
+                status="error",
+                task=task,
+                error=error_msg,
+                steps_taken=steps_taken,
+                max_steps=max_steps,
+                duration_s=duration_s,
+            )
         finally:
             _current_status.update(
                 {"running": False, "task": None, "agent": None}
@@ -204,18 +332,37 @@ async def run_task(
 
 @server.tool()
 async def get_status() -> str:
-    """Check the status of the currently running browser-use task.
+    """Check the status of the currently running or last completed browser-use task.
 
-    Returns whether a task is running, which step it's on, and the task description.
+    Returns whether a task is running (with step progress), or the result
+    of the last completed task if no task is running.
     """
-    if not _current_status["running"]:
-        return "No task is currently running."
+    if _current_status["running"]:
+        return (
+            f"STATUS: RUNNING\n"
+            f"Task: {_current_status['task']}\n"
+            f"Step: {_current_status['step']}/{_current_status['max_steps']}\n"
+            f"Started: {_current_status['started_at']}"
+        )
 
-    return (
-        f"Task: {_current_status['task']}\n"
-        f"Step: {_current_status['step']}/{_current_status['max_steps']}\n"
-        f"Started: {_current_status['started_at']}"
-    )
+    # No task running -- report last completed task if available
+    last_status = _current_status.get("last_status")
+    if last_status:
+        lines = [
+            f"STATUS: IDLE",
+            f"Last task: {_current_status['last_task']}",
+            f"Last result status: {last_status.upper()}",
+            f"Finished at: {_current_status['last_finished_at']}",
+            f"Steps taken: {_current_status['last_steps_taken']}",
+            f"Duration: {_current_status['last_duration_s']:.1f}s",
+        ]
+        if _current_status["last_error"]:
+            lines.append(f"Error: {_current_status['last_error']}")
+        if _current_status["last_result"]:
+            lines.append(f"\nLast result:\n{_current_status['last_result']}")
+        return "\n".join(lines)
+
+    return "STATUS: IDLE\nNo task has been run yet."
 
 
 @server.tool()
@@ -226,10 +373,10 @@ async def stop_task() -> str:
     """
     agent = _current_status.get("agent")
     if not agent or not _current_status["running"]:
-        return "No task is currently running."
+        return "STATUS: IDLE\nNo task is currently running."
 
     agent.state.stopped = True
-    return "Stop signal sent. Task will finish after current step completes."
+    return "STATUS: STOPPING\nStop signal sent. Task will finish after current step completes."
 
 
 def main():
