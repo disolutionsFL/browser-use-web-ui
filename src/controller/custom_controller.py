@@ -30,7 +30,11 @@ from browser_use.tools.views import (
 from browser_use.llm.base import BaseChatModel
 from browser_use.filesystem.file_system import FileSystem
 
-from src.utils.mcp_client import create_tool_param_model, setup_mcp_client_and_tools
+# Lazy import — langchain-mcp-adapters may have version conflicts with
+# langchain-core.  Only import when MCP client features are actually used.
+def _get_mcp_helpers():
+    from src.utils.mcp_client import create_tool_param_model, setup_mcp_client_and_tools
+    return create_tool_param_model, setup_mcp_client_and_tools
 
 logger = logging.getLogger(__name__)
 
@@ -165,7 +169,8 @@ class CustomController(Tools):
     async def setup_mcp_client(self, mcp_server_config: Optional[Dict[str, Any]] = None):
         self.mcp_server_config = mcp_server_config
         if self.mcp_server_config:
-            self.mcp_client = await setup_mcp_client_and_tools(self.mcp_server_config)
+            _, setup_fn = _get_mcp_helpers()
+            self.mcp_client = await setup_fn(self.mcp_server_config)
             self.register_mcp_tools()
 
     def register_mcp_tools(self):
@@ -178,7 +183,7 @@ class CustomController(Tools):
                         name=tool_name,
                         description=tool.description,
                         function=tool,
-                        param_model=create_tool_param_model(tool),
+                        param_model=_get_mcp_helpers()[0](tool),
                     )
                     logger.info(f"Add mcp tool: {tool_name}")
                 logger.debug(
