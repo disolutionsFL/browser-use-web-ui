@@ -43,6 +43,12 @@ DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3-coder-30b-96k:latest")
 DEFAULT_NUM_CTX = int(os.getenv("DEFAULT_NUM_CTX", "16000"))
 TASK_TIMEOUT = int(os.getenv("TASK_TIMEOUT", "300"))
 
+# --- Smart early stopping ---
+# After meaningful content is detected, give the agent a few more steps
+# to call done() properly. If it doesn't, stop it and use the content.
+EARLY_STOP_GRACE_STEPS = int(os.getenv("EARLY_STOP_GRACE_STEPS", "2"))
+EARLY_STOP_MIN_CONTENT_LEN = int(os.getenv("EARLY_STOP_MIN_CONTENT_LEN", "200"))
+
 # --- Concurrency control & state ---
 _task_lock = asyncio.Lock()
 _current_status: dict = {
@@ -188,8 +194,51 @@ async def run_task(
 
             controller = CustomController()
 
+            # --- Smart early stopping callback ---
+            # Tracks when meaningful extracted content first appears.
+            # Gives the agent a grace period to call done() itself;
+            # if it keeps exploring past that, we stop it and harvest
+            # whatever content it already found.
+            _content_found_at_step = None
+
             async def on_step_end(agent):
+                nonlocal _content_found_at_step
                 _current_status["step"] = agent.state.n_steps
+
+                # If the agent already called done, nothing to do
+                if agent.history and agent.history.is_done():
+                    return
+
+                # Scan for meaningful extracted content we haven't seen
+                if _content_found_at_step is None:
+                    for step_info in (agent.history.history if agent.history else []):
+                        for r in step_info.result:
+                            if (r.extracted_content
+                                    and not r.is_done
+                                    and len(r.extracted_content.strip()) > EARLY_STOP_MIN_CONTENT_LEN):
+                                _content_found_at_step = agent.state.n_steps
+                                logger.info(
+                                    "Smart stop: meaningful content (%d chars) detected at step %d, "
+                                    "grace period of %d steps before auto-stop",
+                                    len(r.extracted_content),
+                                    _content_found_at_step,
+                                    EARLY_STOP_GRACE_STEPS,
+                                )
+                                break
+                        if _content_found_at_step is not None:
+                            break
+
+                # If content was found and grace period exhausted, stop
+                if (_content_found_at_step is not None
+                        and agent.state.n_steps - _content_found_at_step >= EARLY_STOP_GRACE_STEPS):
+                    logger.info(
+                        "Smart stop: stopping agent at step %d "
+                        "(content found at step %d, grace=%d exhausted)",
+                        agent.state.n_steps,
+                        _content_found_at_step,
+                        EARLY_STOP_GRACE_STEPS,
+                    )
+                    agent.state.stopped = True
 
             agent = Agent(
                 task=task,
@@ -237,7 +286,32 @@ async def run_task(
                     duration_s=duration_s,
                 )
 
-            # Agent finished without calling done -- hit max steps
+            # Agent finished without calling done — smart-stopped or hit max steps.
+            # Collect the best extracted content from any step.
+            best_content = None
+            if history.history:
+                for step in reversed(history.history):
+                    for result in reversed(step.result):
+                        if result.extracted_content:
+                            best_content = result.extracted_content
+                            break
+                    if best_content:
+                        break
+
+            # If smart-stop triggered and we have content, treat as success
+            if _content_found_at_step is not None and best_content:
+                _save_last_result("completed", task, best_content, None, steps_taken, action_names, duration_s)
+                return _format_result(
+                    status="completed",
+                    task=task,
+                    result=best_content,
+                    steps_taken=steps_taken,
+                    max_steps=max_steps,
+                    actions=action_names,
+                    duration_s=duration_s,
+                )
+
+            # Otherwise it's a genuine max-steps exhaustion
             errors = history.errors()
             error_text = None
             if errors:
@@ -245,22 +319,11 @@ async def run_task(
                 if error_msgs:
                     error_text = "; ".join(error_msgs)
 
-            # Try to extract any useful content from the last step
-            last_content = None
-            if history.history:
-                for step in reversed(history.history):
-                    for result in reversed(step.result):
-                        if result.extracted_content:
-                            last_content = result.extracted_content
-                            break
-                    if last_content:
-                        break
-
-            _save_last_result("max_steps", task, last_content, error_text, steps_taken, action_names, duration_s)
+            _save_last_result("max_steps", task, best_content, error_text, steps_taken, action_names, duration_s)
             return _format_result(
                 status="max_steps_reached",
                 task=task,
-                result=last_content,
+                result=best_content,
                 error=error_text or f"Agent did not call done within {max_steps} steps",
                 steps_taken=steps_taken,
                 max_steps=max_steps,
