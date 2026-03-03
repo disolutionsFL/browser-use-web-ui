@@ -1,4 +1,4 @@
-browser-use @ git+https://github.com/disolutionsFL/browser-use.git@1e6568cf
+browser-use @ git+https://github.com/disolutionsFL/browser-use.git@main
 pyperclip==1.9.0
 gradio==5.27.0
 json-repair

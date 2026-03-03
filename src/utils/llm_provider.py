@@ -258,26 +258,20 @@ def get_llm_model(provider: str, **kwargs):
             api_key=api_key,
         )
     elif provider == "ollama":
+        from browser_use import ChatOllama as BrowserUseChatOllama
+
         if not kwargs.get("base_url", ""):
             base_url = os.getenv("OLLAMA_ENDPOINT", "http://localhost:11434")
         else:
             base_url = kwargs.get("base_url")
 
-        if "deepseek-r1" in kwargs.get("model_name", "qwen2.5:7b"):
-            return DeepSeekR1ChatOllama(
-                model=kwargs.get("model_name", "deepseek-r1:14b"),
-                temperature=kwargs.get("temperature", 0.0),
-                num_ctx=kwargs.get("num_ctx", 32000),
-                base_url=base_url,
-            )
-        else:
-            return ChatOllama(
-                model=kwargs.get("model_name", "qwen2.5:7b"),
-                temperature=kwargs.get("temperature", 0.0),
-                num_ctx=kwargs.get("num_ctx", 32000),
-                num_predict=kwargs.get("num_predict", 1024),
-                base_url=base_url,
-            )
+        num_ctx = kwargs.get("num_ctx", 32000)
+
+        return BrowserUseChatOllama(
+            model=kwargs.get("model_name", "qwen2.5:7b"),
+            host=base_url,
+            ollama_options={"num_ctx": num_ctx},
+        )
     elif provider == "azure_openai":
         if not kwargs.get("base_url", ""):
             base_url = os.getenv("AZURE_OPENAI_ENDPOINT", "")

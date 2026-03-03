@@ -15,7 +15,6 @@ systemd (BB8):
 import asyncio
 import logging
 import os
-import sys
 import argparse
 import time
 from datetime import datetime
@@ -27,13 +26,8 @@ load_dotenv()
 
 from mcp.server.fastmcp import FastMCP
 
-from browser_use.browser.browser import BrowserConfig
-from browser_use.browser.context import BrowserContextConfig
-from src.browser.custom_browser import CustomBrowser
-from src.browser.custom_context import CustomBrowserContext
+from browser_use import Agent, BrowserSession, BrowserProfile, ChatOllama
 from src.controller.custom_controller import CustomController
-from src.agent.browser_use.browser_use_agent import BrowserUseAgent
-from src.utils.llm_provider import get_llm_model
 
 logger = logging.getLogger("browser-use-mcp")
 logging.basicConfig(
@@ -46,7 +40,6 @@ DEFAULT_OLLAMA_ENDPOINT = os.getenv(
     "OLLAMA_ENDPOINT", "http://localhost:11434"
 )
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3-coder-30b-96k:latest")
-DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.6"))
 DEFAULT_NUM_CTX = int(os.getenv("DEFAULT_NUM_CTX", "16000"))
 TASK_TIMEOUT = int(os.getenv("TASK_TIMEOUT", "300"))
 
@@ -139,12 +132,11 @@ async def run_task(
     max_actions_per_step: int = 10,
     ollama_base_url: Optional[str] = None,
     num_ctx: Optional[int] = None,
-    enable_memory: bool = False,
-) -> str:
+):
     """Run a browser automation task using the browser-use agent.
 
     The agent autonomously navigates websites, fills forms, clicks buttons,
-    and extracts information. Returns a structured result with clear STATUS.
+    and extracts information. Returns a structured result string with clear STATUS.
 
     Args:
         task: Natural language description of the browser task to perform.
@@ -154,7 +146,6 @@ async def run_task(
         max_actions_per_step: Max browser actions per reasoning step.
         ollama_base_url: Override Ollama endpoint URL.
         num_ctx: Ollama context window size.
-        enable_memory: Enable agent long-term memory across steps.
     """
     if _task_lock.locked():
         return (
@@ -164,8 +155,7 @@ async def run_task(
         )
 
     async with _task_lock:
-        browser = None
-        context = None
+        browser_session = None
         start_time = time.monotonic()
         steps_taken = 0
         action_names = []
@@ -183,29 +173,17 @@ async def run_task(
             # num_ctx MUST match what Ollama already has loaded, or Ollama
             # resizes the KV cache (unload + reload = expensive swap).
             # DEFAULT_NUM_CTX should match the model's Modelfile num_ctx.
-            llm = get_llm_model(
-                provider="ollama",
-                model_name=model or DEFAULT_MODEL,
-                temperature=DEFAULT_TEMPERATURE,
-                base_url=ollama_base_url or DEFAULT_OLLAMA_ENDPOINT,
-                num_ctx=num_ctx or DEFAULT_NUM_CTX,
+            llm = ChatOllama(
+                model=model or DEFAULT_MODEL,
+                host=ollama_base_url or DEFAULT_OLLAMA_ENDPOINT,
+                ollama_options={"num_ctx": num_ctx or DEFAULT_NUM_CTX},
             )
 
-            browser = CustomBrowser(
-                config=BrowserConfig(
+            browser_session = BrowserSession(
+                browser_profile=BrowserProfile(
                     headless=True,
-                    new_context_config=BrowserContextConfig(
-                        window_width=1280,
-                        window_height=1100,
-                    ),
-                )
-            )
-
-            context = await browser.new_context(
-                config=BrowserContextConfig(
-                    window_width=1280,
-                    window_height=1100,
-                )
+                    window_size={"width": 1280, "height": 1100},
+                ),
             )
 
             controller = CustomController()
@@ -213,24 +191,21 @@ async def run_task(
             async def on_step_end(agent):
                 _current_status["step"] = agent.state.n_steps
 
-            agent = BrowserUseAgent(
+            agent = Agent(
                 task=task,
                 llm=llm,
-                browser=browser,
-                browser_context=context,
-                controller=controller,
+                browser_session=browser_session,
+                tools=controller,
                 use_vision=use_vision,
                 max_actions_per_step=max_actions_per_step,
-                enable_memory=enable_memory,
             )
             _current_status["agent"] = agent
 
             logger.info(
-                "Running task: %s (model=%s, max_steps=%d, memory=%s)",
+                "Running task: %s (model=%s, max_steps=%d)",
                 task,
                 model or DEFAULT_MODEL,
                 max_steps,
-                enable_memory,
             )
 
             history = await asyncio.wait_for(
@@ -321,20 +296,15 @@ async def run_task(
             _current_status.update(
                 {"running": False, "task": None, "agent": None}
             )
-            if context:
+            if browser_session:
                 try:
-                    await context.close()
-                except Exception:
-                    pass
-            if browser:
-                try:
-                    await browser.close()
+                    await browser_session.stop()
                 except Exception:
                     pass
 
 
 @server.tool()
-async def get_status() -> str:
+async def get_status():
     """Check the status of the currently running or last completed browser-use task.
 
     Returns whether a task is running (with step progress), or the result
@@ -369,7 +339,7 @@ async def get_status() -> str:
 
 
 @server.tool()
-async def stop_task() -> str:
+async def stop_task():
     """Stop the currently running browser-use task.
 
     Signals the agent to stop after its current step completes.
